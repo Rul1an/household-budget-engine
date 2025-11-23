@@ -1,9 +1,10 @@
 import { createServerClient } from '@supabase/ssr';
 import { NextResponse, type NextRequest } from 'next/server';
+import { env } from '../../env';
 
 export async function updateSession(request: NextRequest) {
     // Mock Auth Bypass
-    if (process.env.MOCK_AUTH === 'true') {
+    if (env.MOCK_AUTH === 'true') {
         return NextResponse.next({
             request: {
                 headers: request.headers,
@@ -18,8 +19,8 @@ export async function updateSession(request: NextRequest) {
     })
 
     const supabase = createServerClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+        env.NEXT_PUBLIC_SUPABASE_URL,
+        env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
         {
             cookies: {
                 getAll() {

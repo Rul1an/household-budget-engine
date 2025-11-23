@@ -3,51 +3,99 @@
 import { db } from '@/db';
 import { categories, transactions } from '@/db/schema';
 import { createClient } from '@/lib/supabase/server';
+import { retry } from '@/lib/utils';
 import { categorizeTransaction } from '@/modules/ai/categorize';
 import { parseBankExport } from '@/modules/import/parser';
 import { parsePdfBankExport } from '@/modules/import/pdf-parser';
 import { revalidatePath } from 'next/cache';
+import pLimit from 'p-limit';
 
-export async function uploadCsvAction(formData: FormData) {
+export async function validateFileSignature(file: File): Promise<boolean> {
+    const arrayBuffer = await file.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // PDF Signature: %PDF (25 50 44 46)
+    if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
+        if (buffer.length < 4) return false;
+        return buffer.toString('utf8', 0, 4) === '%PDF';
+    }
+
+    // CSV Validation (Heuristic: mostly printable ASCII/UTF-8, no binary control chars)
+    // We check the first 1024 bytes for null bytes or other binary indicators
+    if (file.type === 'text/csv' || file.name.endsWith('.csv')) {
+        const sample = buffer.subarray(0, 1024);
+        for (const byte of sample) {
+            // Allow: printable (32-126), whitespace (9, 10, 13), and extended ASCII/UTF-8 start bytes (>127)
+            if ((byte < 32 && ![9, 10, 13].includes(byte))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+import { errorResponse, successResponse, type ActionResponse } from '@/lib/error-handling';
+
+export async function uploadCsvAction(formData: FormData): Promise<ActionResponse<{ count: number; errors: string[] }>> {
     try {
         const supabase = await createClient();
         const { data: { user } } = await supabase.auth.getUser();
 
         if (!user) {
-            return { success: false, message: 'Unauthorized', errors: [] };
+            return errorResponse('UNAUTHORIZED', 'Je bent niet ingelogd.');
         }
 
         const householdId = formData.get('householdId') as string;
         if (!householdId) {
-            return { success: false, message: 'Household ID required', errors: [] };
+            return errorResponse('MISSING_HOUSEHOLD', 'Huishouden ID ontbreekt.');
         }
 
         const file = formData.get('file') as File;
-        if (!file) return { success: false, message: 'Geen bestand geselecteerd', errors: [] };
+        if (!file) return errorResponse('NO_FILE', 'Geen bestand geselecteerd.');
 
-        let parsedTxns: any[] = [];
+        const isValid = await validateFileSignature(file);
+        if (!isValid) {
+            return errorResponse('INVALID_FILE', 'Ongeldig bestandstype of corrupt bestand. Upload een geldige PDF of CSV.');
+        }
+
+        type ParsedTransaction = {
+            date: Date;
+            amountCents: number;
+            description: string;
+            counterpartyName?: string | null;
+            importHash: string;
+            aiCategory?: string;
+        };
+        let parsedTxns: ParsedTransaction[] = [];
         let errors: string[] = [];
         let adapterUsed = 'UNKNOWN';
 
-        if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
-            // Handle PDF
-            const arrayBuffer = await file.arrayBuffer();
-            const buffer = Buffer.from(arrayBuffer);
-            const result = await parsePdfBankExport(buffer);
-            parsedTxns = result.transactions;
-            errors = result.errors;
-            adapterUsed = result.adapterUsed;
-        } else {
-            // Handle CSV (Default)
-            const text = await file.text();
-            const result = await parseBankExport(text);
-            parsedTxns = result.transactions;
-            errors = result.errors;
-            adapterUsed = result.adapterUsed;
+        try {
+            if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
+                // Handle PDF
+                const arrayBuffer = await file.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                const result = await parsePdfBankExport(buffer);
+                parsedTxns = result.transactions;
+                errors = result.errors;
+                adapterUsed = result.adapterUsed;
+            } else {
+                // Handle CSV (Default)
+                const text = await file.text();
+                const result = await parseBankExport(text);
+                parsedTxns = result.transactions;
+                errors = result.errors;
+                adapterUsed = result.adapterUsed;
+            }
+        } catch (parseError) {
+            console.error('Parse error:', parseError);
+            return errorResponse('PARSE_ERROR', 'Fout bij het lezen van het bestand.', { originalError: parseError });
         }
 
         if (parsedTxns.length === 0) {
-            return { success: false, message: 'Geen transacties gevonden.', errors };
+            return errorResponse('NO_TRANSACTIONS', 'Geen transacties gevonden in dit bestand.', { errors });
         }
 
         // Import dependencies
@@ -80,15 +128,21 @@ export async function uploadCsvAction(formData: FormData) {
         existingCategories.forEach(c => categoryMap.set(c.name.toLowerCase(), c.id));
 
         const CHUNK_SIZE = 50; // Reduced chunk size for AI processing
+        const limit = pLimit(5); // Limit concurrent AI calls
 
         for (let i = 0; i < parsedTxns.length; i += CHUNK_SIZE) {
             const chunk = parsedTxns.slice(i, i + CHUNK_SIZE);
 
-            // 1. Categorize in parallel
-            const categorizedChunk = await Promise.all(chunk.map(async (t) => {
-                const aiResult = await categorizeTransaction(t.description, t.amountCents / 100, t.counterpartyName);
-                return { ...t, aiCategory: aiResult?.category };
-            }));
+            // 1. Categorize in parallel with concurrency limit and retry
+            const categorizedChunk = await Promise.all(chunk.map((t: ParsedTransaction) => limit(() => retry(async () => {
+                try {
+                    const aiResult = await categorizeTransaction(t.description, t.amountCents / 100, t.counterpartyName || undefined);
+                    return { ...t, aiCategory: aiResult?.category };
+                } catch (e) {
+                    console.warn(`AI Categorization failed for "${t.description}":`, e);
+                    return { ...t, aiCategory: undefined };
+                }
+            }, 3, 1000))));
 
             // 2. Identify and create missing categories
             const categoriesToCreate = new Set<string>();
@@ -135,17 +189,10 @@ export async function uploadCsvAction(formData: FormData) {
         }
 
         revalidatePath('/transactions');
-        return {
-            success: true,
-            message: `Succesvol ${parsedTxns.length} transacties geïmporteerd`,
-            errors: errors.length > 0 ? errors : []
-        };
+        return successResponse({ count: parsedTxns.length, errors }, `Succesvol ${parsedTxns.length} transacties geïmporteerd.`);
+
     } catch (error) {
         console.error('Upload error:', error);
-        return {
-            success: false,
-            message: `Fout tijdens verwerking: ${error instanceof Error ? error.message : 'Onbekende fout'}`,
-            errors: []
-        };
+        return errorResponse('INTERNAL_ERROR', `Onverwachte fout: ${error instanceof Error ? error.message : 'Onbekend'}`, { error });
     }
 }
